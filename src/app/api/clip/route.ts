@@ -1,13 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import ffmpegPath from "ffmpeg-static";
-import ffmpeg from "fluent-ffmpeg";
+import ffmpeg, { getFfmpegBinary } from "@/lib/ffmpeg";
 import path from "path";
 import fs from "fs";
 import { randomUUID } from "crypto";
-
-if (ffmpegPath) {
-  ffmpeg.setFfmpegPath(ffmpegPath);
-}
 
 const CLIPS_DIR = path.join(process.cwd(), "public", "clips");
 
@@ -51,7 +46,8 @@ export async function POST(req: NextRequest) {
   try {
     ensureClipsDir();
 
-    if (!ffmpegPath) {
+    const binary = getFfmpegBinary();
+    if (!binary) {
       return NextResponse.json(
         { success: false, error: "FFmpeg binary is not available on this server." },
         { status: 500 }
