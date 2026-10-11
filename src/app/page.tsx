@@ -10,13 +10,11 @@ import {
   Pause,
   RotateCcw,
   RotateCw,
-  Sliders,
-  CheckCircle2,
   Tv,
   Film,
   Sparkles,
   Server,
-  Share2,
+  Zap,
 } from "lucide-react";
 
 interface ClipItem {
@@ -72,7 +70,6 @@ function parseYouTubeId(input: string): string | null {
       }
     }
   } catch {
-    // If not a full URL, fallback regex
     const match = input.match(/(?:youtu\.be\/|youtube\.com\/(?:embed\/|v\/|watch\?v=|live\/))([\w-]{11})/);
     return match ? match[1] : null;
   }
@@ -80,7 +77,7 @@ function parseYouTubeId(input: string): string | null {
 }
 
 export default function HealCutStudio() {
-  const [streamUrl, setStreamUrl] = useState("https://www.youtube.com/watch?v=jfKfPfyJRdk"); // lofi live sample
+  const [streamUrl, setStreamUrl] = useState("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
   const [activeVideoId, setActiveVideoId] = useState<string | null>(null);
   const [playerState, setPlayerState] = useState<"idle" | "playing" | "paused" | "buffering">("idle");
   const [currentTime, setCurrentTime] = useState(0);
@@ -94,14 +91,11 @@ export default function HealCutStudio() {
   const [statusType, setStatusType] = useState<"info" | "success" | "live">("info");
   const [clips, setClips] = useState<ClipItem[]>([]);
   const [serverHealth, setServerHealth] = useState<ServerHealth | null>(null);
-  const [clipMode, setClipMode] = useState<"server" | "browser">("server");
 
   const playerRef = useRef<any>(null);
   const pollTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const screenSourceRef = useRef<HTMLVideoElement | null>(null);
-  const displayStreamRef = useRef<MediaStream | null>(null);
 
-  // Check backend FFmpeg health
+  // Check backend health
   useEffect(() => {
     fetch("/api/health")
       .then((res) => res.json())
@@ -129,7 +123,7 @@ export default function HealCutStudio() {
             duration: 0,
             aspectRatio: "16:9",
             sizeBytes: c.sizeBytes,
-            timeRange: "Server Clip",
+            timeRange: "Direct Stream Clip",
             createdAt: c.createdAt,
           }));
           setClips(loaded);
@@ -138,7 +132,7 @@ export default function HealCutStudio() {
       .catch(() => {});
   }, []);
 
-  // Initialize YouTube API
+  // Initialize YouTube Iframe API
   useEffect(() => {
     if (!window.YT) {
       const tag = document.createElement("script");
@@ -147,7 +141,7 @@ export default function HealCutStudio() {
     }
   }, []);
 
-  // Synchronize player time & duration
+  // Synchronize playback time
   const syncPlayback = useCallback(() => {
     if (!playerRef.current || typeof playerRef.current.getCurrentTime !== "function") return;
     try {
@@ -156,15 +150,13 @@ export default function HealCutStudio() {
       setCurrentTime(t);
       if (d > 0) setDuration(d);
 
-      // Auto initialize default range if empty
       setInPoint((prev) => (prev === null ? Math.max(0, t - 30) : prev));
       setOutPoint((prev) => (prev === null ? t : prev));
     } catch {
-      // player might be unmounting
+      // ignore
     }
   }, []);
 
-  // Poll video timecode
   useEffect(() => {
     if (activeVideoId) {
       pollTimerRef.current = setInterval(syncPlayback, 400);
@@ -184,7 +176,7 @@ export default function HealCutStudio() {
     }
 
     setActiveVideoId(vidId);
-    setStatusMessage("Connecting to YouTube DVR stream...");
+    setStatusMessage("Connecting to stream...");
     setStatusType("info");
 
     const setupPlayer = () => {
@@ -205,7 +197,7 @@ export default function HealCutStudio() {
         },
         events: {
           onReady: () => {
-            setStatusMessage("Connected · Live DVR stream active");
+            setStatusMessage("Connected · Direct Stream Extraction Ready");
             setStatusType("live");
             playerRef.current.playVideo();
           },
@@ -300,7 +292,7 @@ export default function HealCutStudio() {
     setOutPoint(Math.min(duration, nextOut));
   };
 
-  // Generate Clip
+  // Direct Stream Clip Generation (ZERO Screen Recording)
   const handleCreateClip = async () => {
     const start = inPoint ?? 0;
     const end = outPoint ?? currentTime;
@@ -312,156 +304,49 @@ export default function HealCutStudio() {
 
     const clipDuration = end - start;
     setIsProcessing(true);
-    setStatusMessage(`Processing ${formatTime(start)} → ${formatTime(end)} (${Math.round(clipDuration)}s)...`);
+    setStatusMessage(
+      `Directly downloading & cutting ${formatTime(start)} → ${formatTime(end)} (${Math.round(clipDuration)}s) straight from live feed...`
+    );
+    setStatusType("info");
 
-    if (clipMode === "server") {
-      try {
-        const response = await fetch("/api/clip", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            streamUrl,
-            startTime: start,
-            endTime: end,
-            aspectRatio,
-            title: clipTitle,
-          }),
-        });
-
-        const data = await response.json();
-        if (data.success && data.clip) {
-          const newClip: ClipItem = {
-            id: data.clip.id,
-            title: clipTitle,
-            downloadUrl: data.clip.downloadUrl,
-            duration: Math.round(clipDuration),
-            aspectRatio,
-            sizeBytes: data.clip.sizeBytes,
-            timeRange: `${formatTime(start)} – ${formatTime(end)}`,
-            createdAt: new Date().toISOString(),
-          };
-          setClips((prev) => [newClip, ...prev]);
-          setStatusMessage(`Clip generated: ${clipTitle} (${formatTime(clipDuration)})`);
-          setStatusType("success");
-        } else {
-          // If server stream copy encounters YouTube rate limit, offer browser tab fallback
-          console.warn("Server FFmpeg fallback to browser recorder:", data.error);
-          setStatusMessage("Server requires direct stream link. Switching to Browser Studio Engine...");
-          await handleBrowserTabClip(start, end, clipDuration);
-        }
-      } catch (err) {
-        console.error("Clip request error:", err);
-        setStatusMessage("Falling back to Browser Studio Engine...");
-        await handleBrowserTabClip(start, end, clipDuration);
-      } finally {
-        setIsProcessing(false);
-      }
-    } else {
-      await handleBrowserTabClip(start, end, clipDuration);
-      setIsProcessing(false);
-    }
-  };
-
-  // Browser Tab Studio Engine fallback
-  const handleBrowserTabClip = async (start: number, end: number, clipDuration: number) => {
     try {
-      if (!displayStreamRef.current) {
-        setStatusMessage("Requesting browser tab capture with audio...");
-        const stream = await navigator.mediaDevices.getDisplayMedia({
-          video: { frameRate: { ideal: 30, max: 60 } },
-          audio: true,
-        });
-        displayStreamRef.current = stream;
-      }
-
-      const stream = displayStreamRef.current;
-      const playerEl = document.getElementById("healcut-player");
-      if (!playerEl || !stream) throw new Error("Display stream or player element unavailable");
-
-      // Setup Canvas
-      const canvas = document.createElement("canvas");
-      canvas.width = aspectRatio === "9:16" ? 1080 : 1920;
-      canvas.height = aspectRatio === "9:16" ? 1920 : aspectRatio === "1:1" ? 1080 : 1080;
-      if (aspectRatio === "1:1") canvas.width = 1080;
-
-      const ctx = canvas.getContext("2d", { alpha: false });
-      const videoTrack = stream.getVideoTracks()[0];
-      const audioTrack = stream.getAudioTracks()[0];
-
-      // Video element to pull frames
-      const v = document.createElement("video");
-      v.srcObject = stream;
-      v.muted = true;
-      await v.play();
-
-      const canvasStream = canvas.captureStream(30);
-      const outStream = new MediaStream([
-        canvasStream.getVideoTracks()[0],
-        ...(audioTrack ? [audioTrack] : []),
-      ]);
-
-      const chunks: Blob[] = [];
-      const mime = ["video/mp4;codecs=avc1", "video/mp4", "video/webm"].find((m) =>
-        MediaRecorder.isTypeSupported(m)
-      );
-      const recorder = new MediaRecorder(outStream, { mimeType: mime });
-
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunks.push(e.data);
-      };
-
-      // Seek to IN and play
-      playerRef.current.seekTo(start, true);
-      playerRef.current.playVideo();
-
-      recorder.start();
-      setStatusMessage(`Recording live playback: ${Math.round(clipDuration)}s...`);
-
-      // Draw frames
-      const drawTimer = setInterval(() => {
-        if (!ctx) return;
-        const rect = playerEl.getBoundingClientRect();
-        const sx = v.videoWidth / window.innerWidth;
-        const sy = v.videoHeight / window.innerHeight;
-        const x = Math.max(0, rect.left * sx);
-        const y = Math.max(0, rect.top * sy);
-        const w = Math.min(rect.width * sx, v.videoWidth - x);
-        const h = Math.min(rect.height * sy, v.videoHeight - y);
-
-        ctx.fillStyle = "#000";
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        if (w > 0 && h > 0) {
-          ctx.drawImage(v, x, y, w, h, 0, 0, canvas.width, canvas.height);
-        }
-      }, 33);
-
-      await new Promise<void>((resolve) => {
-        setTimeout(() => {
-          clearInterval(drawTimer);
-          recorder.stop();
-          recorder.onstop = () => {
-            const blob = new Blob(chunks, { type: mime || "video/mp4" });
-            const url = URL.createObjectURL(blob);
-            const newClip: ClipItem = {
-              id: `browser_${Date.now()}`,
-              title: clipTitle,
-              downloadUrl: url,
-              duration: Math.round(clipDuration),
-              aspectRatio,
-              sizeBytes: blob.size,
-              timeRange: `${formatTime(start)} – ${formatTime(end)}`,
-              createdAt: new Date().toISOString(),
-            };
-            setClips((prev) => [newClip, ...prev]);
-            setStatusMessage(`Clip recorded successfully: ${clipTitle}`);
-            setStatusType("success");
-            resolve();
-          };
-        }, clipDuration * 1000);
+      const response = await fetch("/api/clip", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          streamUrl,
+          startTime: start,
+          endTime: end,
+          aspectRatio,
+          title: clipTitle,
+        }),
       });
+
+      const data = await response.json();
+      if (data.success && data.clip) {
+        const newClip: ClipItem = {
+          id: data.clip.id,
+          title: clipTitle,
+          downloadUrl: data.clip.downloadUrl,
+          duration: Math.round(clipDuration),
+          aspectRatio,
+          sizeBytes: data.clip.sizeBytes,
+          timeRange: `${formatTime(start)} – ${formatTime(end)}`,
+          createdAt: new Date().toISOString(),
+        };
+        setClips((prev) => [newClip, ...prev]);
+        setStatusMessage(`Direct clip created: ${clipTitle} (${formatTime(clipDuration)})`);
+        setStatusType("success");
+      } else {
+        throw new Error(data.error || "Direct recording failed");
+      }
     } catch (err: any) {
-      console.error(err);
-      setStatusMessage(err.message || "Recording cancelled");
+      console.error("Direct clip error:", err);
+      alert(`Direct Recording Error: ${err.message || err}`);
+      setStatusMessage("Direct stream extraction error");
+      setStatusType("info");
+    } finally {
+      setIsProcessing(false);
     }
   };
 
@@ -488,19 +373,19 @@ export default function HealCutStudio() {
             <span className="brand-dot" />
             HealCUT
           </div>
-          <span className="brand-badge">PRO STUDIO</span>
+          <span className="brand-badge">DIRECT STREAM STUDIO</span>
         </div>
 
         <div className="nav-actions">
           {serverHealth && (
             <div className={`engine-pill ${serverHealth.available ? "ready" : ""}`}>
               <Server size={12} />
-              <span>FFmpeg: {serverHealth.available ? "Online (6.1.1)" : "Offline"}</span>
+              <span>FFmpeg 6.1.1: {serverHealth.available ? "Online" : "Offline"}</span>
             </div>
           )}
           <div className="engine-pill ready">
-            <Radio size={12} className="text-red-500" />
-            <span>DVR Lossless Segmenter</span>
+            <Zap size={12} className="text-lime-400" />
+            <span>Direct Stream Extraction (No Screen Recording)</span>
           </div>
         </div>
       </header>
@@ -512,7 +397,7 @@ export default function HealCutStudio() {
           <div className="panel-header">
             <div className="panel-title">
               <Tv size={14} />
-              Live Broadcast Monitor
+              Live DVR Monitor
             </div>
             <div className={`status-badge ${statusType}`}>
               {statusMessage.toUpperCase()}
@@ -524,7 +409,7 @@ export default function HealCutStudio() {
             <input
               id="stream-url-input"
               className="stream-input"
-              placeholder="Paste YouTube Live Link (or direct stream URL)..."
+              placeholder="Paste YouTube Live Link or HLS Stream (.m3u8)..."
               value={streamUrl}
               onChange={(e) => setStreamUrl(e.target.value)}
             />
@@ -539,9 +424,9 @@ export default function HealCutStudio() {
             <button
               id="btn-sample-stream"
               className="btn"
-              title="Load sample 24/7 live stream"
+              title="Load sample video to test direct cutting"
               onClick={() => {
-                const sample = "https://www.youtube.com/watch?v=jfKfPfyJRdk";
+                const sample = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
                 setStreamUrl(sample);
                 handleLoadStream(sample);
               }}
@@ -558,7 +443,7 @@ export default function HealCutStudio() {
             {!activeVideoId && (
               <div className="monitor-placeholder">
                 <Film className="monitor-placeholder-icon" />
-                <p>Paste a YouTube Live stream or HLS link to initialize the DVR monitor.</p>
+                <p>Paste a YouTube Live stream to initialize the monitor.</p>
               </div>
             )}
 
@@ -567,7 +452,7 @@ export default function HealCutStudio() {
               <div className={`aspect-overlay ratio-${aspectRatio.replace(":", "-")}`}>
                 <div className="aspect-box">
                   <span className="aspect-guide-tag">
-                    {aspectRatio === "9:16" ? "Shorts / Reels Crop" : "Square 1:1 Crop"}
+                    {aspectRatio === "9:16" ? "Shorts / Reels Framing" : "Square 1:1 Framing"}
                   </span>
                 </div>
               </div>
@@ -736,7 +621,7 @@ export default function HealCutStudio() {
                     className={`aspect-tab ${aspectRatio === "16:9" ? "active" : ""}`}
                     onClick={() => setAspectRatio("16:9")}
                   >
-                    16:9 Landscape
+                    16:9 Widescreen
                   </button>
                   <button
                     id="tab-9-16"
@@ -772,7 +657,7 @@ export default function HealCutStudio() {
                   disabled={isProcessing || !activeVideoId || selectedDuration <= 0}
                 >
                   <Scissors size={14} />
-                  {isProcessing ? "Processing..." : "Cut & Generate Clip"}
+                  {isProcessing ? "Direct Recording..." : "Cut & Generate Clip"}
                 </button>
               </div>
             </div>
@@ -801,8 +686,8 @@ export default function HealCutStudio() {
               <span>Seek rewind buffer -5s / +5s</span>
             </div>
             <div className="shortcut-item">
-              <span className="kbd">9:16</span>
-              <span>Auto-crops center vertical frame</span>
+              <span className="kbd">Direct</span>
+              <span>Backend extracts exact stream segments</span>
             </div>
           </div>
         </section>
@@ -814,7 +699,7 @@ export default function HealCutStudio() {
               <Film size={14} />
               Generated Clips ({clips.length})
             </div>
-            <span className="status-badge">SESSION QUEUE</span>
+            <span className="status-badge">DIRECT DOWNLOADS</span>
           </div>
 
           <div className="clips-scroll">
@@ -823,7 +708,7 @@ export default function HealCutStudio() {
                 <Scissors size={28} style={{ opacity: 0.25, margin: "0 auto 12px" }} />
                 <p>No clips generated yet.</p>
                 <small style={{ color: "var(--text-subtle)", marginTop: "4px", display: "block" }}>
-                  Set an IN &amp; OUT marker on any highlight and click "Cut &amp; Generate Clip".
+                  Set an IN &amp; OUT marker and click "Cut &amp; Generate Clip" to extract directly from the stream.
                 </small>
               </div>
             ) : (
@@ -865,19 +750,6 @@ export default function HealCutStudio() {
           </div>
         </aside>
       </main>
-
-      <video
-        ref={screenSourceRef}
-        muted
-        playsInline
-        style={{
-          position: "fixed",
-          width: "2px",
-          height: "2px",
-          opacity: 0.01,
-          pointerEvents: "none",
-        }}
-      />
     </div>
   );
 }
