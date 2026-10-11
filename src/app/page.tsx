@@ -77,7 +77,7 @@ function parseYouTubeId(input: string): string | null {
 }
 
 export default function HealCutStudio() {
-  const [streamUrl, setStreamUrl] = useState("https://www.youtube.com/watch?v=dQw4w9WgXcQ");
+  const [streamUrl, setStreamUrl] = useState("https://www.youtube.com/watch?v=3hXiSEvrE_4");
   const [activeVideoId, setActiveVideoId] = useState<string | null>(null);
   const [playerState, setPlayerState] = useState<"idle" | "playing" | "paused" | "buffering">("idle");
   const [currentTime, setCurrentTime] = useState(0);
@@ -426,7 +426,7 @@ export default function HealCutStudio() {
               className="btn"
               title="Load sample video to test direct cutting"
               onClick={() => {
-                const sample = "https://www.youtube.com/watch?v=dQw4w9WgXcQ";
+                const sample = "https://www.youtube.com/watch?v=3hXiSEvrE_4";
                 setStreamUrl(sample);
                 handleLoadStream(sample);
               }}

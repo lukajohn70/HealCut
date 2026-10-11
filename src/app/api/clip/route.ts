@@ -15,12 +15,31 @@ function ensureClipsDir() {
   }
 }
 
-function formatSecs(sec: number): string {
-  const s = Math.max(0, Math.floor(sec || 0));
-  const hrs = Math.floor(s / 3600);
-  const mins = Math.floor((s % 3600) / 60);
-  const secs = s % 60;
-  return `${String(hrs).padStart(2, "0")}:${String(mins).padStart(2, "0")}:${String(secs).padStart(2, "0")}`;
+async function resolveDirectStreams(url: string): Promise<{ videoUrl: string; audioUrl?: string; isHls: boolean }> {
+  if (url.includes(".m3u8")) {
+    return { videoUrl: url, isHls: true };
+  }
+
+  const ytDlp = getYtDlpBinary();
+  const node = getNodeBinary();
+  const target = url.startsWith("http") ? url : `https://www.youtube.com/watch?v=${url.trim()}`;
+
+  const cmd = `"${ytDlp}" --js-runtimes node:"${node}" -g "${target}"`;
+  console.log("[HealCUT Resolve] Resolving stream URL with command:", cmd);
+
+  const { stdout } = await execAsync(cmd, { maxBuffer: 1024 * 1024 * 20 });
+  const lines = stdout.trim().split("\n").map((l) => l.trim()).filter((l) => l.startsWith("http"));
+
+  if (!lines.length) {
+    throw new Error("Could not extract a live stream URL. Please ensure the stream is currently live or public.");
+  }
+
+  const isHls = lines[0].includes(".m3u8");
+  if (!isHls && lines.length >= 2) {
+    return { videoUrl: lines[0], audioUrl: lines[1], isHls: false };
+  }
+
+  return { videoUrl: lines[0], isHls };
 }
 
 // GET /api/clip - List saved clips
@@ -52,15 +71,12 @@ export async function GET() {
   }
 }
 
-// POST /api/clip - Direct stream recording and cutting
+// POST /api/clip - True direct stream extraction and segment cutting
 export async function POST(req: NextRequest) {
   try {
     ensureClipsDir();
 
     const ffmpegBin = getFfmpegBinary();
-    const ytDlpBin = getYtDlpBinary();
-    const nodeBin = getNodeBinary();
-
     if (!ffmpegBin) {
       return NextResponse.json(
         { success: false, error: "FFmpeg binary is unavailable on the server." },
@@ -79,7 +95,7 @@ export async function POST(req: NextRequest) {
 
     if (!streamUrl || typeof streamUrl !== "string") {
       return NextResponse.json(
-        { success: false, error: "Missing streamUrl parameter." },
+        { success: false, error: "Missing or empty streamUrl parameter." },
         { status: 400 }
       );
     }
@@ -97,7 +113,7 @@ export async function POST(req: NextRequest) {
     const duration = end - start;
     if (duration > 1800) {
       return NextResponse.json(
-        { success: false, error: "Maximum clip length is 30 minutes." },
+        { success: false, error: "Maximum clip duration is 30 minutes." },
         { status: 400 }
       );
     }
@@ -106,113 +122,76 @@ export async function POST(req: NextRequest) {
     const finalFilename = `${clipId}.mp4`;
     const finalPath = path.join(CLIPS_DIR, finalFilename);
 
-    const isYouTube =
-      streamUrl.includes("youtube.com") ||
-      streamUrl.includes("youtu.be") ||
-      /^[a-zA-Z0-9_-]{11}$/.test(streamUrl.trim());
+    // 1. Resolve raw direct stream URLs (HLS m3u8 or raw video/audio endpoints)
+    const { videoUrl, audioUrl, isHls } = await resolveDirectStreams(streamUrl);
+    console.log(`[HealCUT Direct Stream] isHls=${isHls}, video=${videoUrl.slice(0, 60)}...`);
 
-    if (isYouTube) {
-      // Direct stream segment download via yt-dlp & FFmpeg
-      const sectionArg = `*${formatSecs(start)}-${formatSecs(end)}`;
-      const tempFilename = `temp_${clipId}.mp4`;
-      const tempPath = path.join(CLIPS_DIR, tempFilename);
+    // 2. Direct FFmpeg extraction
+    await new Promise<void>((resolve, reject) => {
+      let command = ffmpeg();
 
-      const targetUrl = streamUrl.includes("http")
-        ? streamUrl
-        : `https://www.youtube.com/watch?v=${streamUrl.trim()}`;
+      // Configure input streams
+      command = command
+        .input(videoUrl)
+        .inputOption(`-ss ${start}`)
+        .inputOption(`-t ${duration}`);
 
-      const cmd = `"${ytDlpBin}" --js-runtimes node:"${nodeBin}" --ffmpeg-location "${ffmpegBin}" --download-sections "${sectionArg}" --force-keyframes-at-cuts -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best" -o "${tempPath}" "${targetUrl}"`;
-
-      console.log("[HealCUT Direct Record] Running:", cmd);
-
-      try {
-        await execAsync(cmd, { maxBuffer: 1024 * 1024 * 50 });
-      } catch (ytErr: any) {
-        console.error("[HealCUT Direct Record Error]:", ytErr);
-        throw new Error(
-          ytErr.stderr || ytErr.message || "Failed to download live stream segment directly."
-        );
+      if (audioUrl) {
+        command = command
+          .input(audioUrl)
+          .inputOption(`-ss ${start}`)
+          .inputOption(`-t ${duration}`);
       }
 
-      // Check if temp file was downloaded
-      if (!fs.existsSync(tempPath)) {
-        throw new Error("Direct recording file could not be produced for this segment.");
-      }
-
-      // If aspect ratio adjustment is required (e.g. 9:16 Shorts or 1:1 Square)
+      // Aspect Ratio filter & encoding
       if (aspectRatio === "9:16") {
-        await new Promise<void>((resolve, reject) => {
-          ffmpeg(tempPath)
-            .videoFilters([
-              "crop=ih*(9/16):ih",
-              "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
-            ])
-            .videoCodec("libx264")
-            .audioCodec("aac")
-            .outputOptions(["-preset", "veryfast", "-crf", "22", "-movflags", "+faststart"])
-            .on("error", (err) => reject(err))
-            .on("end", () => {
-              fs.unlinkSync(tempPath);
-              resolve();
-            })
-            .save(finalPath);
-        });
+        command = command
+          .videoFilters([
+            "crop=ih*(9/16):ih",
+            "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
+          ])
+          .videoCodec("libx264")
+          .audioCodec("aac")
+          .outputOptions(["-preset", "veryfast", "-crf", "22", "-movflags", "+faststart"]);
       } else if (aspectRatio === "1:1") {
-        await new Promise<void>((resolve, reject) => {
-          ffmpeg(tempPath)
-            .videoFilters([
-              "crop=ih:ih",
-              "scale=1080:1080:force_original_aspect_ratio=decrease,pad=1080:1080:(ow-iw)/2:(oh-ih)/2",
-            ])
-            .videoCodec("libx264")
-            .audioCodec("aac")
-            .outputOptions(["-preset", "veryfast", "-crf", "22", "-movflags", "+faststart"])
-            .on("error", (err) => reject(err))
-            .on("end", () => {
-              fs.unlinkSync(tempPath);
-              resolve();
-            })
-            .save(finalPath);
-        });
+        command = command
+          .videoFilters([
+            "crop=ih:ih",
+            "scale=1080:1080:force_original_aspect_ratio=decrease,pad=1080:1080:(ow-iw)/2:(oh-ih)/2",
+          ])
+          .videoCodec("libx264")
+          .audioCodec("aac")
+          .outputOptions(["-preset", "veryfast", "-crf", "22", "-movflags", "+faststart"]);
       } else {
-        // 16:9 - Rename directly (lossless)
-        fs.renameSync(tempPath, finalPath);
-      }
-    } else {
-      // Direct HLS / Media stream (.m3u8, RTMP, HTTP live feed)
-      await new Promise<void>((resolve, reject) => {
-        let command = ffmpeg(streamUrl)
-          .setStartTime(start)
-          .setDuration(duration);
-
-        if (aspectRatio === "9:16") {
-          command = command
-            .videoFilters([
-              "crop=ih*(9/16):ih",
-              "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2",
-            ])
-            .videoCodec("libx264")
-            .audioCodec("aac")
-            .outputOptions(["-preset", "veryfast", "-crf", "22", "-movflags", "+faststart"]);
-        } else if (aspectRatio === "1:1") {
-          command = command
-            .videoFilters([
-              "crop=ih:ih",
-              "scale=1080:1080:force_original_aspect_ratio=decrease,pad=1080:1080:(ow-iw)/2:(oh-ih)/2",
-            ])
-            .videoCodec("libx264")
-            .audioCodec("aac")
-            .outputOptions(["-preset", "veryfast", "-crf", "22", "-movflags", "+faststart"]);
+        // 16:9 Standard
+        if (isHls && !audioUrl) {
+          // Lossless copy directly from HLS segment stream
+          command = command.outputOptions(["-c", "copy", "-movflags", "+faststart"]);
         } else {
           command = command
-            .outputOptions(["-c", "copy", "-movflags", "+faststart"]);
+            .videoCodec("libx264")
+            .audioCodec("aac")
+            .outputOptions(["-preset", "veryfast", "-crf", "22", "-movflags", "+faststart"]);
         }
+      }
 
-        command
-          .on("error", (err) => reject(err))
-          .on("end", () => resolve())
-          .save(finalPath);
-      });
+      command
+        .on("start", (cmd) => {
+          console.log("[HealCUT FFmpeg Direct] Executing:", cmd);
+        })
+        .on("error", (err, stdout, stderr) => {
+          console.error("[HealCUT FFmpeg Direct Error]:", err.message, stderr);
+          reject(new Error(err.message || stderr || "Stream clipping failed"));
+        })
+        .on("end", () => {
+          console.log("[HealCUT FFmpeg Direct] Complete:", finalFilename);
+          resolve();
+        })
+        .save(finalPath);
+    });
+
+    if (!fs.existsSync(finalPath)) {
+      throw new Error("Output clip file was not generated.");
     }
 
     const fileStats = fs.statSync(finalPath);
@@ -233,11 +212,11 @@ export async function POST(req: NextRequest) {
       },
     });
   } catch (error: unknown) {
-    console.error("[HealCUT Clip Error]:", error);
+    console.error("[HealCUT Route Error]:", error);
     return NextResponse.json(
       {
         success: false,
-        error: error instanceof Error ? error.message : "Direct recording failed",
+        error: error instanceof Error ? error.message : "Direct stream recording failed",
       },
       { status: 500 }
     );
